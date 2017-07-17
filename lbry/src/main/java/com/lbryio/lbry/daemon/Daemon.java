@@ -1,12 +1,23 @@
 package com.lbryio.lbry.daemon;
 
+import android.app.IntentService;
 import android.content.Context;
+import android.os.Environment;
+import android.os.Handler;
 import android.util.Log;
 
 
+import com.lbryio.lbry.Conf;
+import com.lbryio.lbry.Manager;
 import com.lbryio.lbry.core.BlobManager;
+import com.lbryio.lbry.core.StreamDescriptorIdentifier;
 import com.lbryio.lbry.core.Utils;
 import com.lbryio.lbry.daemon.auth.AuthJSONRPCServer;
+import com.lbryio.lbry.file_manager.EncryptedFileManager;
+import com.lbryio.lbry.lbry_file.DBEncryptedFileMetadataManager;
+
+import org.json.JSONException;
+import org.json.JSONObject;
 
 import java.io.File;
 import java.io.IOException;
@@ -21,8 +32,8 @@ import java.io.IOException;
 
 class Checker {
 	//The looping calls the daemon runs
-	public final String INTERNET_CONNECTION = "internet_connection_checker";
-	public final String CONNECTION_STATUS = "connection_status_checker";
+	public static String INTERNET_CONNECTION = "internet_connection_checker";
+	public static String CONNECTION_STATUS = "connection_status_checker";
 }
 
 
@@ -42,14 +53,65 @@ class FileID {
 //TODO alert if your copy of a lbry file is out of date with the name record
 
 
-class CheckInternetConnection {
+class CheckInternetConnection implements Runnable {
 	private Daemon daemon;
-	public  CheckInternetConnection (Daemon daemon) {
+	private final Handler handler = new Handler();
+	private final int delayTime = 3600;
+
+	public  CheckInternetConnection(Daemon daemon) {
 		this.daemon = daemon;
 	}
 
-	public void set () {
+	@Override
+	public void run() {
+		this.checkConnection();
+		handler.postDelayed(this, delayTime);
+	}
+
+	public void start() {
+		handler.postDelayed(this, delayTime);
+	}
+
+	public void stop() {
+		handler.removeCallbacks(this);
+	}
+
+	public void checkConnection () {
+
 		this.daemon.connected_to_internet = Utils.check_connection();
+	}
+}
+
+
+class UpdateConnection implements Runnable {
+	private Daemon daemon;
+	private final Handler handler = new Handler();
+	private final int delayTime = 30;
+
+	public  UpdateConnection(Daemon daemon) {
+		this.daemon = daemon;
+	}
+
+	@Override
+	public void run() {
+		this._update_connection_status();
+		handler.postDelayed(this, delayTime);
+	}
+
+	public void start() {
+		handler.postDelayed(this, delayTime);
+	}
+
+	public void stop() {
+		handler.removeCallbacks(this);
+	}
+
+	public void _update_connection_status() {
+		this.daemon.connection_status_code = Daemon.CONNECTION_STATUS_CONNECTED;
+
+		if (!this.daemon.connected_to_internet) {
+			this.daemon.connection_status_code = Daemon.CONNECTION_STATUS_NETWORK;
+		}
 	}
 }
 
@@ -87,7 +149,7 @@ class AlwaysSend {
 
 
 
-public class Daemon {
+public class Daemon extends AuthJSONRPCServer {
 
 	//LBRYnet daemon, a jsonrpc interface to lbry functions
 
@@ -132,18 +194,135 @@ public class Daemon {
 
 	static final String CONNECTION_STATUS_CONNECTED = "connected";
 	static final String CONNECTION_STATUS_NETWORK = "network_connection";
-//	static final JSONArray CONNECTION_MESSAGES = {
-//			CONNECTION_STATUS_CONNECTED: "No connection problems detected",
-//			CONNECTION_STATUS_NETWORK: "Your internet connection appears to have been interrupted",
-//	};
+	static final JSONObject CONNECTION_MESSAGES = new JSONObject();
 
 	static final short SHORT_ID_LEN = 20;
 
 
-	public boolean connected_to_internet;
+	// intialize
+	private String 		allowed_during_startup[] = { "stop", "status", "version"};
+	private String	 	db_dir;
+	private String	 	download_directory;
+	private String 		blobfile_dir;
+	private float 		data_rate;
+	private JSONObject	max_key_fee;
+	private int			download_timeout;
+	private boolean		run_reflector_server;
+	private String		wallet_type;
+	private boolean		delete_blobs_on_remove;
+	private int			peer_port;
+	private int			reflector_port;
+	private int			dht_node_port;
+	private boolean		use_upnp;
+	private String[]	startup_status;
+	public 	boolean		connected_to_internet;
+	public String 		connection_status_code;
+	private String		platform;
+	private int			current_db_revision;
+	private String		db_revision_file;
+	private Object		session;
+	private String[]	uploaded_temp_files;
+	private String		_session_id;
+	private Manager		analytics_manager;
+	private String		lbryid;
+	private String 		wallet_user;
+	private String 		wallet_password;
+
+	private String[] 	query_handlers;
+	private String[]	waiting_on;
+	private	String[]	streams;
+	private String[]	name_cache;
+
+	private ExchangeRateManager		exchange_rate_manager;
+	private DBEncryptedFileMetadataManager		stream_info_manager;
+	private EncryptedFileManager lbry_file_manager;
+	private StreamDescriptorIdentifier sd_identifier;
 
 
-	Daemon() {
+	Daemon(LBRYindex root, Manager analytics_manager) {
+		super(Conf.settings.use_auth_http);
+
+		try {
+			CONNECTION_MESSAGES.put(CONNECTION_STATUS_CONNECTED, "No connection problems detected");
+			CONNECTION_MESSAGES.put(CONNECTION_STATUS_NETWORK, "Your internet connection appears to have been interrupted");
+		} catch (JSONException e) {
+			e.printStackTrace();;
+		}
+		this.db_dir = Conf.settings.data_dir;
+		this.download_directory = Conf.settings.download_directory;
+
+		if (Conf.settings.BLOBFILES_DIR == "blobfiles") {
+			this.blobfile_dir = Environment.getRootDirectory() +"/" + this.db_dir + "/"  + "blobfiles";
+		} else {
+			Log.i("Daemon", "Using non-default blobfiles directory: " + Conf.settings.BLOBFILES_DIR);
+			this.blobfile_dir = Conf.settings.BLOBFILES_DIR;
+		}
+
+		this.data_rate = Conf.settings.data_rate;
+		this.max_key_fee = Conf.settings.max_key_fee;
+		this.download_timeout = Conf.settings.download_timeout;
+		this.run_reflector_server = Conf.settings.run_reflector_server;
+		this.wallet_type = Conf.settings.wallet;
+		this.delete_blobs_on_remove = Conf.settings.delete_blobs_on_remove;
+		this.peer_port = Conf.settings.peer_port;
+		this.reflector_port = Conf.settings.reflector_port;
+		this.dht_node_port = Conf.settings.dht_node_port;
+		this.use_upnp = Conf.settings.use_upnp;
+
+		this.startup_status = STARTUP_STAGES[0];
+		this.connected_to_internet = true;
+		this.connection_status_code = null;
+		this.platform = null;
+		this.current_db_revision = 3;
+		this.db_revision_file = Conf.settings.get_db_revision_filename();
+		this.session = null;
+		this.uploaded_temp_files = new String[0];
+		this._session_id = Conf.settings.get_session_id();
+        // TODO: this should probably be passed into the daemon, or
+        // possibly have the entire log upload functionality taken out
+        // of the daemon, but I don't want to deal with that now
+
+		this.analytics_manager = analytics_manager;
+		this.lbryid = Utils.generate_id();
+
+		this.wallet_user = null;
+		this.wallet_password = null;
+		this.query_handlers = new String[0];
+
+		this.waiting_on = new String[0];
+		this.streams = new String[0];
+		this.name_cache = new String[0];
+		this.exchange_rate_manager = new ExchangeRateManager();
+
+		//batch timers
+//		calls = {
+//				Checker.INTERNET_CONNECTION: LoopingCall(CheckInternetConnection(self)),
+//				Checker.CONNECTION_STATUS: LoopingCall(self._update_connection_status),
+//        }
+//		self.looping_call_manager = LoopingCallManager(calls)
+
+
+		this.sd_identifier = new StreamDescriptorIdentifier();
+		this.stream_info_manager = null;
+		this.lbry_file_manager = null;
+
+	}
+
+	@Override
+	public  void onDestroy() {
+		this._shutdown();
+	}
+
+	public void setup() {
+//		this._modify_loggly_formatter();
+		Log.i("Daemon", "Starting lbrynet-daemon");
+
+		new CheckInternetConnection(this).start();
+		new UpdateConnection(this).start();
+		this.exchange_rate_manager.start();
+	}
+
+	private void _shutdown() {
 
 	}
 

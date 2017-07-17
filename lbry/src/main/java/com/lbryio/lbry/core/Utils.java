@@ -8,4 +8,8 @@ public class Utils {
     static  public boolean check_connection() {
         return true;
     }
+
+    static public  String generate_id() {
+        return null;
+    }
 }
